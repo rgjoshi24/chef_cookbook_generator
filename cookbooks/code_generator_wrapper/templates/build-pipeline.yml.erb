@@ -1,0 +1,113 @@
+trigger:
+- master
+
+pool:
+  name: Linux-AgentPool
+  demands:
+    - app_family -equals java
+    - aws_env -equals development
+
+steps:       
+  - script: |
+      # Define a function that returns true if cookbook version passed as argument 1 
+      # is greater than or equal to the cookbook version passed as argument 2      
+      semver_gte() { 
+        [ "$1" == "$( echo -e "$1\n$2" | sort -rV | head -n1 )" ]
+      }
+
+      # Grab the version strings from the master and current branches
+      master_version=$( git show origin/master:metadata.rb | grep "^version" | tr '"' "'" | cut -f2 -d\' )
+      branch_version=$( grep "^version" metadata.rb | tr '"' "'" | cut -f2 -d\' )
+    
+      echo 'Feature branch cookbook version:' $branch_version
+      echo 'Master branch cookbook version: ' $master_version
+
+      if semver_gte "$master_version" "$branch_version"; then
+        echo 'ERROR: Cookbook version must be greater than the version in the master branch'
+        exit 1
+      fi
+    workingDirectory: $(Build.Repository.LocalPath)
+    condition: and(succeeded(), ne(variables['Build.SourceBranch'], 'refs/heads/master')) # Don't run on master
+    displayName: 'Verify cookbook version bump'
+
+  - task: DownloadSecureFile@1
+    inputs:
+      secureFile: pipeline2.pem
+    displayName: 'Download admin key for Chef Server'
+
+  - task: DownloadSecureFile@1
+    inputs:
+      secureFile: ChefKitchenDevOnly.pem
+    displayName: 'Download ssh key for Test Kitchen instances'
+
+  - script: |
+      if [ ! -d /opt/chef-workstation ]; then
+        curl -L https://omnitruck.chef.io/install.sh | bash -s -- -P chef-workstation
+        chef env -chef-license accept
+      fi
+    displayName: 'Install Chef Workstation'
+
+  - script: |
+      # Create a config.rb file that uses the pem file that was downloaded
+
+      mkdir -p ~/.chef
+      mv $(Agent.TempDirectory)/pipeline2.pem ~/.chef
+
+      cat >~/.chef/config.rb <<EOF
+      current_dir = File.dirname(__FILE__)
+      log_level :info
+      log_location STDOUT
+      node_name 'pipeline2'
+      client_key "#{current_dir}/pipeline2.pem"
+      chef_server_url '<%= node['code_generator_wrapper']['chef_server_url'] %>'
+      knife[:supermarket_site] = '<%= node['code_generator_wrapper']['chef_supermarket_url'] %>'
+      chef_license 'accept'
+      EOF
+
+      # Fetch the latest SSL certs
+
+      knife ssl fetch https://<%= node['code_generator_wrapper']['chef_server_fqdn'] %>
+      knife ssl fetch https://<%= node['code_generator_wrapper']['chef_supermarket_fqdn'] %>
+    displayName: 'Set up access to Chef server'
+
+  - script: chef exec cookstyle
+    displayName: 'Run Cookstyle'
+
+  - script: |
+      # Include custom foodcritic rules, if present
+      if [ -f .foodcritic_rules.rb ]; then
+        chef exec foodcritic -I .foodcritic_rules.rb .
+      else
+        chef exec foodcritic .
+      fi
+    displayName: 'Run Foodcritic'
+
+  - script: chef exec kitchen verify -c
+    # 2019-06-06 Encourage concurrent builds with "-c"
+    env:
+      KITCHEN_ID: ChefKitchenDevOnly
+      KITCHEN_KEY_PATH: $(Agent.TempDirectory)/ChefKitchenDevOnly.pem
+    displayName: 'Run Test Kitchen - Verify'
+
+  - script: chef exec kitchen destroy
+    displayName: 'Run Test Kitchen - Destroy'
+    condition: always()
+
+  - script: |
+      if [ -f $(Build.Repository.Name).rb ]; then
+        chef install $(Build.Repository.Name).rb
+      fi
+    displayName: 'Update policy if present, and on master branch'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master')) # Only run on master
+
+  - script: |
+      /bin/rm -rf ~/.chef ~/.chefdk
+      /bin/rm -f $(Agent.TempDirectory)/ChefKitchenDevOnly.pem
+    displayName: 'Clean up'
+    condition: always()
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish cookbook to Release pipeline'
+    inputs:
+      PathtoPublish: '$(System.DefaultWorkingDirectory)'
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master')) # Only run on master
